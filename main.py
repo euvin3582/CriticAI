@@ -189,7 +189,7 @@ def main() -> None:
     # Auto-resolve threads from previous reviews (user pushed a fix)
     # Passes the diff so the LLM can semantically evaluate whether each
     # concern was addressed — not just whether the exact line changed.
-    resolve_outdated_threads(github, config, diff)
+    resolve_outdated_threads(github, config, diff, head_sha=head_sha)
 
 
 if __name__ == "__main__":
