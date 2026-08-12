@@ -41,7 +41,7 @@ inputs:
       tokens — too low a value can make the model spend its whole budget
       reasoning and return no visible text (see NOTICE.md).
     required: false
-    default: 3072
+    default: 8192
   # Custom
   prompt:
     description: >
