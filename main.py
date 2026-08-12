@@ -186,8 +186,10 @@ def main() -> None:
     else:
         print("No structured findings — inline review skipped.")
 
-    # Auto-resolve outdated threads from previous reviews (user pushed a fix)
-    resolve_outdated_threads(github, config)
+    # Auto-resolve threads from previous reviews (user pushed a fix)
+    # Passes the diff so the LLM can semantically evaluate whether each
+    # concern was addressed — not just whether the exact line changed.
+    resolve_outdated_threads(github, config, diff)
 
 
 if __name__ == "__main__":

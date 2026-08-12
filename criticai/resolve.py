@@ -1,9 +1,12 @@
-"""Auto-resolve outdated review threads.
+"""Auto-resolve review threads using LLM-based semantic analysis.
 
-When a user pushes a fix, GitHub marks the inline review comment as
-"outdated" (the diff position no longer exists). This module detects
-those threads and resolves them automatically so the developer doesn't
-have to click "Resolve conversation" on each one manually.
+When a user pushes a fix, this module evaluates ALL unresolved review
+threads posted by CriticAI — not just ones GitHub marks as "outdated".
+
+Instead of relying on GitHub's naive line-position check (which only
+triggers when the exact line changes), we use Claude to analyze the
+surrounding code and the new diff to determine whether the concern
+raised in the review comment has been semantically addressed.
 
 Uses the GitHub GraphQL API because resolving review threads is not
 available via the REST API.
@@ -11,7 +14,7 @@ available via the REST API.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import requests
 
@@ -22,7 +25,7 @@ if TYPE_CHECKING:
 
 GRAPHQL_URL = "https://api.github.com/graphql"
 
-# GraphQL query to fetch all review threads on a PR
+# GraphQL query to fetch all review threads with file/line context
 _QUERY_THREADS = """
 query($owner: String!, $repo: String!, $pr: Int!) {
   repository(owner: $owner, name: $repo) {
@@ -32,6 +35,10 @@ query($owner: String!, $repo: String!, $pr: Int!) {
           id
           isResolved
           isOutdated
+          path
+          line
+          originalLine
+          diffSide
           comments(first: 1) {
             nodes {
               author {
@@ -69,9 +76,40 @@ mutation($threadId: ID!) {
 }
 """
 
+# System prompt for the resolution-check LLM call
+_RESOLUTION_SYSTEM_PROMPT = """You are a code review resolution detector. Your job is to determine whether a review comment's concern has been addressed by the developer's changes.
 
-def resolve_outdated_threads(github: "GitHubClient", config: "Config") -> int:
-    """Find and resolve all outdated review threads posted by this bot.
+You will be given:
+1. The original review comment (the concern that was raised)
+2. The current code surrounding the area where the comment was made
+3. The diff showing what changed in the latest push
+
+Analyze the LOGIC and INTENT of the fix, not just whether the specific line was modified. A fix might:
+- Be on a different line in the same function
+- Be in a different file (e.g., adding validation in a utility used by the flagged code)
+- Restructure the code so the original concern no longer applies
+- Add a guard clause, error handling, or type check elsewhere that addresses the issue
+
+Respond with ONLY a JSON object (no markdown fencing):
+{"resolved": true, "reason": "brief explanation"} or {"resolved": false, "reason": "brief explanation"}
+"""
+
+# Context window: how many lines above/below the comment to fetch
+_CONTEXT_LINES = 30
+
+
+def resolve_outdated_threads(
+    github: "GitHubClient",
+    config: "Config",
+    diff: str = "",
+) -> int:
+    """Find and resolve review threads whose concerns have been addressed.
+
+    Uses a two-pass approach:
+    1. Fast path: threads GitHub already marked as outdated are resolved
+       immediately (no LLM call needed — the line was clearly changed).
+    2. Semantic path: for remaining unresolved threads, asks Claude whether
+       the concern was addressed by analyzing the surrounding code + diff.
 
     Returns the number of threads resolved.
     """
@@ -112,17 +150,14 @@ def resolve_outdated_threads(github: "GitHubClient", config: "Config") -> int:
     )
 
     resolved_count = 0
+    semantic_candidates = []
 
     for thread in threads:
         # Skip already-resolved threads
         if thread.get("isResolved"):
             continue
 
-        # Only resolve threads that are outdated (code no longer at that position)
-        if not thread.get("isOutdated"):
-            continue
-
-        # Only resolve threads authored by this bot
+        # Only touch threads authored by this bot
         comments = thread.get("comments", {}).get("nodes", [])
         if not comments:
             continue
@@ -133,34 +168,200 @@ def resolve_outdated_threads(github: "GitHubClient", config: "Config") -> int:
 
         thread_id = thread["id"]
 
-        # Reply with a resolution message
-        reply_response = session.post(GRAPHQL_URL, json={
-            "query": _MUTATION_REPLY,
-            "variables": {
-                "threadId": thread_id,
-                "body": "✅ Fixed — this finding no longer applies to the current code.",
-            },
-        })
-        if reply_response.status_code != 200:
-            print(f"  Warning: could not reply to thread {thread_id}")
+        # Fast path: GitHub already marked it as outdated (line was changed)
+        if thread.get("isOutdated"):
+            if _resolve_thread(session, thread_id, "✅ Fixed — this finding no longer applies to the current code."):
+                resolved_count += 1
             continue
 
-        # Resolve the thread
-        resolve_response = session.post(GRAPHQL_URL, json={
-            "query": _MUTATION_RESOLVE,
-            "variables": {"threadId": thread_id},
-        })
-        if resolve_response.status_code != 200:
-            print(f"  Warning: could not resolve thread {thread_id}")
-            continue
+        # Collect for semantic analysis
+        semantic_candidates.append(thread)
 
-        resolve_data = resolve_response.json()
-        if resolve_data.get("data", {}).get("resolveReviewThread", {}).get("thread", {}).get("isResolved"):
-            resolved_count += 1
+    # Semantic path: use the LLM to check remaining threads
+    if semantic_candidates and diff:
+        print(f"Evaluating {len(semantic_candidates)} unresolved thread(s) with LLM...")
+        for thread in semantic_candidates:
+            thread_id = thread["id"]
+            file_path = thread.get("path") or ""
+            line_number = thread.get("line") or thread.get("originalLine")
+            comment_body = thread["comments"]["nodes"][0]["body"]
+
+            # Fetch surrounding code for context
+            file_context = _get_file_context(github, file_path, line_number)
+
+            # Ask the LLM if the concern was addressed
+            is_resolved, reason = _check_resolution_with_llm(
+                config, comment_body, file_context, diff, file_path, line_number
+            )
+
+            if is_resolved:
+                resolution_msg = f"✅ Fixed — LLM determined this concern was addressed: {reason}"
+                if _resolve_thread(session, thread_id, resolution_msg):
+                    resolved_count += 1
+                    print(f"  Resolved: {file_path}:{line_number} — {reason}")
+            else:
+                print(f"  Still open: {file_path}:{line_number} — {reason}")
 
     if resolved_count > 0:
-        print(f"Auto-resolved {resolved_count} outdated review thread(s).")
+        print(f"Auto-resolved {resolved_count} review thread(s).")
     else:
-        print("No outdated threads to resolve.")
+        print("No threads to resolve.")
 
     return resolved_count
+
+
+def _resolve_thread(session: requests.Session, thread_id: str, message: str) -> bool:
+    """Reply to a thread with a message and then resolve it.
+
+    Returns True if successfully resolved.
+    """
+    # Reply with a resolution message
+    reply_response = session.post(GRAPHQL_URL, json={
+        "query": _MUTATION_REPLY,
+        "variables": {"threadId": thread_id, "body": message},
+    })
+    if reply_response.status_code != 200:
+        print(f"  Warning: could not reply to thread {thread_id}")
+        return False
+
+    # Resolve the thread
+    resolve_response = session.post(GRAPHQL_URL, json={
+        "query": _MUTATION_RESOLVE,
+        "variables": {"threadId": thread_id},
+    })
+    if resolve_response.status_code != 200:
+        print(f"  Warning: could not resolve thread {thread_id}")
+        return False
+
+    resolve_data = resolve_response.json()
+    return (
+        resolve_data.get("data", {})
+        .get("resolveReviewThread", {})
+        .get("thread", {})
+        .get("isResolved", False)
+    )
+
+
+def _get_file_context(
+    github: "GitHubClient", file_path: str, line_number: Optional[int]
+) -> str:
+    """Fetch the current file content around the commented line.
+
+    Returns a snippet of the file with line numbers, or an empty string
+    if the file can't be fetched (deleted, binary, etc.).
+    """
+    if not file_path:
+        return ""
+
+    content = github.get_file_content(file_path)
+    if not content:
+        return f"[File {file_path} not found or could not be fetched]"
+
+    lines = content.splitlines()
+
+    if line_number is None:
+        # No specific line — return first 60 lines as context
+        snippet_lines = lines[:60]
+        start = 1
+    else:
+        # Window around the commented line
+        start = max(1, line_number - _CONTEXT_LINES)
+        end = min(len(lines), line_number + _CONTEXT_LINES)
+        snippet_lines = lines[start - 1:end]
+
+    # Format with line numbers for clarity
+    numbered = []
+    for i, line in enumerate(snippet_lines, start=start):
+        marker = " >>> " if (line_number and i == line_number) else "     "
+        numbered.append(f"{i:4d}{marker}{line}")
+
+    return f"File: {file_path}\n" + "\n".join(numbered)
+
+
+def _check_resolution_with_llm(
+    config: "Config",
+    comment_body: str,
+    file_context: str,
+    diff: str,
+    file_path: str,
+    line_number: Optional[int],
+) -> tuple[bool, str]:
+    """Ask Claude whether a review finding has been addressed.
+
+    Returns (is_resolved, reason).
+    """
+    import json as _json
+    from criticai.providers.base import get_provider
+
+    # Build the user prompt with all relevant context
+    user_content = (
+        f"## Original Review Comment\n"
+        f"File: {file_path}, Line: {line_number}\n\n"
+        f"{comment_body}\n\n"
+        f"---\n\n"
+        f"## Current Code (surrounding the commented area)\n\n"
+        f"{file_context}\n\n"
+        f"---\n\n"
+        f"## Diff (changes in this push)\n\n"
+        f"{_truncate_diff(diff, file_path)}\n"
+    )
+
+    # Use the same model configured for reviews
+    model_id = config.model
+    try:
+        provider = get_provider(model_id, config)
+        response_text = provider.invoke(model_id, _RESOLUTION_SYSTEM_PROMPT, user_content)
+
+        # Parse the JSON response
+        # Strip markdown code fences if the model wraps them
+        cleaned = response_text.strip()
+        if cleaned.startswith("```"):
+            cleaned = "\n".join(cleaned.split("\n")[1:])
+        if cleaned.endswith("```"):
+            cleaned = "\n".join(cleaned.split("\n")[:-1])
+        cleaned = cleaned.strip()
+
+        result = _json.loads(cleaned)
+        return result.get("resolved", False), result.get("reason", "no reason given")
+
+    except Exception as e:
+        print(f"  Warning: LLM resolution check failed for {file_path}:{line_number}: {e}")
+        # On failure, don't resolve — err on the side of keeping it open
+        return False, f"LLM check failed: {e}"
+
+
+def _truncate_diff(diff: str, target_file: str) -> str:
+    """Extract the diff section most relevant to the target file.
+
+    If the full diff is too large, only include the target file's section
+    plus a summary of other changed files.
+    """
+    import re
+
+    # If diff is small enough, include it all
+    if len(diff) < 8000:
+        return diff
+
+    # Extract just the target file's diff section
+    sections = re.split(r"(?=^diff --git )", diff, flags=re.MULTILINE)
+    target_section = ""
+    other_files = []
+
+    for section in sections:
+        if not section.strip():
+            continue
+        match = re.search(r"diff --git a/(.*?) b/", section)
+        if match:
+            section_file = match.group(1)
+            if section_file == target_file:
+                target_section = section
+            else:
+                other_files.append(section_file)
+
+    result = target_section
+    if other_files:
+        result += f"\n\n[Other files changed in this push: {', '.join(other_files[:10])}]"
+        if len(other_files) > 10:
+            result += f" (and {len(other_files) - 10} more)"
+
+    return result if result else diff[:8000]
