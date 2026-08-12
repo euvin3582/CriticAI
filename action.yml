@@ -32,7 +32,7 @@ inputs:
       response). Leave empty to disable fallback. Can mix providers, e.g.
       an OpenAI primary with an Anthropic fallback.
     required: false
-    default: 'anthropic.claude-haiku-4-5-20251001-v1:0'
+    default: 'us.anthropic.claude-3-5-haiku-20241022-v1:0'
   max-tokens:
     description: >
       Max output tokens. For Anthropic, 3072 is Bedrock's ceiling for this
