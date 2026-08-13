@@ -30,16 +30,17 @@ def main() -> None:
     github = GitHubClient(config)
     engine = ReviewEngine(config)
 
-    # Fetch PR diff (incremental if this is a re-review)
+    # Fetch PR diff — always use the FULL PR diff for review so all
+    # findings are surfaced at once. The incremental SHA is only used
+    # for resolution tracking (knowing what's new since last review).
     existing_id, existing_body = github.find_existing_comment()
     last_reviewed_sha = extract_reviewed_sha(existing_body)
 
     if last_reviewed_sha:
-        print(f"Previous review found (reviewed at {last_reviewed_sha}) — trying incremental diff.")
-        raw_diff = github.get_pr_diff(base_sha=last_reviewed_sha)
-    else:
-        raw_diff = github.get_pr_diff()
+        print(f"Previous review found (reviewed at {last_reviewed_sha}).")
 
+    # Always review the full PR diff so every issue is caught in one pass
+    raw_diff = github.get_pr_diff()
     diff = filter_diff(raw_diff, config.home_directory)
 
     # Fetch head SHA for labeling the comment
