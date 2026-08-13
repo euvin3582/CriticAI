@@ -160,6 +160,24 @@ def main() -> None:
             min_confidence = "high"  # stricter noise control when severity threshold is high
         filtered_findings = filter_by_confidence(review_output.findings, min_confidence)
 
+        # Deduplicate: skip findings that match an existing unresolved bot thread
+        # on the same file (prevents re-posting the same comment on every push).
+        existing_threads = github.get_existing_bot_threads()
+        if existing_threads:
+            deduplicated = []
+            for finding in filtered_findings:
+                if _finding_already_posted(finding, existing_threads):
+                    print(
+                        f"  Skipping duplicate: {finding.path}:{finding.line} "
+                        f"(already posted in a previous review)"
+                    )
+                else:
+                    deduplicated.append(finding)
+            skipped = len(filtered_findings) - len(deduplicated)
+            if skipped:
+                print(f"  Deduplication: skipped {skipped} finding(s) already posted.")
+            filtered_findings = deduplicated
+
         position_map = build_position_map(diff)
         inline_comments = []
 
@@ -193,6 +211,45 @@ def main() -> None:
         github, config, diff, head_sha=head_sha,
         review_summary=review_output.summary,
     )
+
+
+def _finding_already_posted(finding, existing_threads: list[dict]) -> bool:
+    """Check if a finding matches an existing unresolved bot thread.
+
+    Matches by file path and keyword overlap in the comment body.
+    This prevents the bot from posting the same inline comment on
+    every push when the developer hasn't addressed it yet.
+    """
+    import re as _re
+
+    for thread in existing_threads:
+        # Must be on the same file
+        if thread["path"] != finding.path:
+            continue
+
+        # Check keyword overlap between the finding and the existing comment
+        existing_body = thread["body"].lower()
+        finding_body = finding.format_body().lower()
+
+        # Extract meaningful words (4+ chars)
+        def extract_words(text):
+            cleaned = _re.sub(r"[`*~#\[\](){}|>]", " ", text)
+            return set(_re.findall(r"\b[a-z]{4,}\b", cleaned))
+
+        existing_words = extract_words(existing_body)
+        finding_words = extract_words(finding_body)
+
+        if not existing_words or not finding_words:
+            continue
+
+        overlap = existing_words & finding_words
+        # If 40%+ of the finding's keywords are in the existing thread,
+        # it's likely the same concern
+        overlap_ratio = len(overlap) / max(len(finding_words), 1)
+        if overlap_ratio >= 0.4:
+            return True
+
+    return False
 
 
 if __name__ == "__main__":

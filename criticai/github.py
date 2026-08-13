@@ -197,6 +197,89 @@ class GitHubClient:
                 print(f"  Response: {e.response.text[:500]}")
 
     # ------------------------------------------------------------------
+    # Existing thread lookup (deduplication)
+    # ------------------------------------------------------------------
+
+    def get_existing_bot_threads(self) -> list[dict]:
+        """Fetch all unresolved review threads posted by this bot.
+
+        Returns a list of dicts with keys: path, body (first comment body).
+        Used to deduplicate findings so the bot doesn't re-post the same
+        inline comment on every push.
+        """
+        owner, repo = self._config.repository.split("/", 1)
+        pr_number = int(self._config.pr_number)
+        bot_login = self._resolve_bot_login()
+
+        # Also match without [bot] suffix (GraphQL inconsistency)
+        bot_logins = {bot_login, bot_login.replace("[bot]", "")}
+        if bot_login == "github-actions[bot]":
+            bot_logins.add("github-actions")
+        elif bot_login == "github-actions":
+            bot_logins.add("github-actions[bot]")
+
+        query = """
+        query($owner: String!, $repo: String!, $pr: Int!) {
+          repository(owner: $owner, name: $repo) {
+            pullRequest(number: $pr) {
+              reviewThreads(first: 100) {
+                nodes {
+                  isResolved
+                  path
+                  comments(first: 1) {
+                    nodes {
+                      author { login }
+                      body
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+        """
+
+        try:
+            response = self._session.post(
+                "https://api.github.com/graphql",
+                json={"query": query, "variables": {"owner": owner, "repo": repo, "pr": pr_number}},
+            )
+            if response.status_code != 200:
+                return []
+
+            data = response.json()
+            if data.get("errors"):
+                return []
+
+            threads = (
+                data.get("data", {})
+                .get("repository", {})
+                .get("pullRequest", {})
+                .get("reviewThreads", {})
+                .get("nodes", [])
+            )
+
+            existing = []
+            for thread in threads:
+                if thread.get("isResolved"):
+                    continue
+                comments = thread.get("comments", {}).get("nodes", [])
+                if not comments:
+                    continue
+                author = (comments[0].get("author") or {}).get("login", "")
+                if author not in bot_logins:
+                    continue
+                existing.append({
+                    "path": thread.get("path", ""),
+                    "body": comments[0].get("body", ""),
+                })
+
+            return existing
+
+        except requests.RequestException:
+            return []
+
+    # ------------------------------------------------------------------
     # Identity resolution
     # ------------------------------------------------------------------
 
