@@ -293,21 +293,73 @@ def _matches_resolved_finding(
 ) -> bool:
     """Check if a thread matches one of the resolved findings from the summary.
 
-    Matches by file path. If the thread's file matches a resolved finding's
-    file, we consider it resolved (the review LLM already confirmed this).
+    Matches by file path AND content similarity. If the thread's file matches
+    a resolved finding's file, we additionally check that the comment body
+    shares keywords with the resolved finding text to avoid false positives
+    when multiple findings exist on the same file.
     """
     if not resolved_patterns or not thread_file_path:
         return False
 
-    for pattern in resolved_patterns:
+    for i, pattern in enumerate(resolved_patterns):
         pattern_file = pattern["file_path"]
-        # Match if the thread's file path ends with or equals the pattern file
-        if (thread_file_path == pattern_file or
+        # First gate: file path must match
+        if not (thread_file_path == pattern_file or
                 thread_file_path.endswith("/" + pattern_file) or
                 pattern_file.endswith("/" + thread_file_path)):
+            continue
+
+        # Second gate: the thread's comment body must share meaningful
+        # keywords with the resolved finding text from the summary.
+        # This prevents resolving unrelated threads on the same file.
+        if _content_matches(comment_body, pattern["full_text"]):
+            # Consume the pattern so it doesn't match additional threads
+            resolved_patterns.pop(i)
             return True
 
     return False
+
+
+def _content_matches(comment_body: str, summary_finding_text: str) -> bool:
+    """Check if a thread's comment body is related to a resolved summary finding.
+
+    Uses keyword overlap between the inline comment and the summary text.
+    The summary finding contains the category and description snippet,
+    e.g. "Security — breadcrumbs persisted raw user identifiers".
+    The inline comment body contains the full explanation.
+
+    Returns True if there's meaningful overlap suggesting they refer to
+    the same concern.
+    """
+    # Extract meaningful words (3+ chars, lowercased, no markdown/symbols)
+    def extract_keywords(text: str) -> set:
+        # Remove markdown formatting
+        cleaned = re.sub(r"[`*~#\[\](){}|>]", " ", text.lower())
+        # Extract words 4+ chars (skip short function words)
+        words = set(re.findall(r"\b[a-z]{4,}\b", cleaned))
+        # Remove common stop words that don't carry meaning
+        stop_words = {
+            "this", "that", "with", "from", "have", "been", "will",
+            "would", "could", "should", "about", "their", "which",
+            "when", "where", "what", "than", "them", "then", "into",
+            "some", "other", "more", "very", "just", "also", "your",
+            "each", "only", "level", "warning", "info", "error",
+            "major", "minor", "critical", "resolved", "push",
+        }
+        return words - stop_words
+
+    comment_keywords = extract_keywords(comment_body)
+    summary_keywords = extract_keywords(summary_finding_text)
+
+    if not comment_keywords or not summary_keywords:
+        # If we can't extract keywords, fall back to file-path-only match
+        return True
+
+    # Require at least 2 shared keywords, or 30%+ overlap with the summary
+    overlap = comment_keywords & summary_keywords
+    overlap_ratio = len(overlap) / max(len(summary_keywords), 1)
+
+    return len(overlap) >= 2 or overlap_ratio >= 0.3
 
 
 # ------------------------------------------------------------------
