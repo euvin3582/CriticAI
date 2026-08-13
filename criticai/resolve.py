@@ -144,8 +144,16 @@ def resolve_outdated_threads(
         "Content-Type": "application/json",
     })
 
-    # Resolve the bot's login to only touch our own threads
+    # Resolve the bot's login to only touch our own threads.
+    # GitHub's GraphQL API sometimes returns "github-actions" without the
+    # "[bot]" suffix, while REST returns "github-actions[bot]". Handle both.
     bot_login = github._resolve_bot_login()
+    bot_logins = {bot_login, bot_login.replace("[bot]", "")}
+    if bot_login == "github-actions[bot]":
+        bot_logins.add("github-actions")
+    elif bot_login == "github-actions":
+        bot_logins.add("github-actions[bot]")
+    print(f"Bot identity: {bot_login!r} (matching against {bot_logins})")
 
     # Parse resolved findings from the summary comment (pass 1 matching data)
     resolved_patterns = _extract_resolved_findings(review_summary)
@@ -176,8 +184,18 @@ def resolve_outdated_threads(
         .get("nodes", [])
     )
 
+    if not threads:
+        pr_data = data.get("data", {}).get("repository", {}).get("pullRequest")
+        if pr_data is None:
+            print("Warning: GraphQL returned null pullRequest — token may lack read access.")
+        else:
+            print("No review threads found on this PR.")
+        return 0
+
     resolved_count = 0
     semantic_candidates = []
+
+    print(f"Found {len(threads)} total review thread(s) on PR.")
 
     for thread in threads:
         # Skip already-resolved threads
@@ -190,7 +208,8 @@ def resolve_outdated_threads(
             continue
         first_comment = comments[0]
         author = (first_comment.get("author") or {}).get("login", "")
-        if author != bot_login:
+        if author not in bot_logins:
+            print(f"  Skipping thread on {thread.get('path', '?')} — author {author!r} != bot {bot_logins}")
             continue
 
         thread_id = thread["id"]
