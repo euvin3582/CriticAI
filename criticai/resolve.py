@@ -388,7 +388,11 @@ def _content_matches(comment_body: str, summary_finding_text: str) -> bool:
 def _resolve_thread(session: requests.Session, thread_id: str, message: str) -> bool:
     """Reply to a thread with a message and then resolve it.
 
-    Returns True if successfully resolved.
+    Posts the reply first (more likely to succeed), then attempts resolution.
+    If resolution fails (e.g., after a force-push), the reply still serves
+    as a visible marker that the concern was addressed.
+
+    Returns True if the reply was posted (even if resolution fails).
     """
     # Reply with a resolution message
     reply_response = session.post(GRAPHQL_URL, json={
@@ -402,29 +406,39 @@ def _resolve_thread(session: requests.Session, thread_id: str, message: str) -> 
     reply_data = reply_response.json()
     reply_errors = reply_data.get("errors")
     if reply_errors:
-        print(f"  Warning: GraphQL error replying to thread {thread_id}: {reply_errors[0].get('message', '')}")
+        error_msg = reply_errors[0].get('message', '')
+        print(f"  Warning: GraphQL error replying to thread {thread_id}: {error_msg}")
         return False
 
-    # Resolve the thread
+    # Attempt to resolve the thread (may fail after force-push or due to
+    # token permissions — the reply above still marks it visually).
     resolve_response = session.post(GRAPHQL_URL, json={
         "query": _MUTATION_RESOLVE,
         "variables": {"threadId": thread_id},
     })
     if resolve_response.status_code != 200:
-        print(f"  Warning: could not resolve thread {thread_id} (HTTP {resolve_response.status_code})")
-        return False
+        print(f"  Note: reply posted but could not resolve thread {thread_id} (HTTP {resolve_response.status_code})")
+        return True  # Reply succeeded — count as resolved for our purposes
 
     resolve_data = resolve_response.json()
     resolve_errors = resolve_data.get("errors")
     if resolve_errors:
-        print(f"  Warning: GraphQL error resolving thread {thread_id}: {resolve_errors[0].get('message', '')}")
-        return False
+        error_msg = resolve_errors[0].get('message', '')
+        if "not accessible" in error_msg.lower():
+            print(
+                f"  Note: reply posted but resolveReviewThread blocked "
+                f"(thread {thread_id}). This typically happens after a "
+                f"force-push. The '✅ Fixed' reply is still visible."
+            )
+        else:
+            print(f"  Note: reply posted but resolve mutation failed: {error_msg}")
+        return True  # Reply succeeded — the thread is visually marked
 
     return (
         resolve_data.get("data", {})
         .get("resolveReviewThread", {})
         .get("thread", {})
-        .get("isResolved", False)
+        .get("isResolved", True)  # Default to True since reply succeeded
     )
 
 
