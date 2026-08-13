@@ -27,17 +27,21 @@ class ReviewEngine:
         context: Optional[str] = None,
         rules_prompt: str = "",
         learnings_prompt: str = "",
+        incremental_diff: str = "",
     ) -> Optional[str]:
         """Execute the review. Returns the review markdown, or None if all models failed.
 
         Args:
-            diff: The filtered PR diff text.
+            diff: The full filtered PR diff text.
             previous_findings: Prior findings for resolution tracking.
             context: Additional file contents for cross-file awareness.
             rules_prompt: Custom rules from .criticai.yml to inject.
             learnings_prompt: Team learnings/suppression info.
+            incremental_diff: Changes since the last review (for resolution tracking).
         """
-        user_content = self._build_user_content(diff, previous_findings, context)
+        user_content = self._build_user_content(
+            diff, previous_findings, context, incremental_diff
+        )
         system_prompt = self._build_system_prompt(rules_prompt, learnings_prompt)
 
         # Try primary model
@@ -85,7 +89,8 @@ class ReviewEngine:
         return " ".join(parts)
 
     def _build_user_content(
-        self, diff: str, previous_findings: Optional[str], context: Optional[str] = None
+        self, diff: str, previous_findings: Optional[str],
+        context: Optional[str] = None, incremental_diff: str = "",
     ) -> str:
         """Build the user message content with optional context and prior findings."""
         parts: list[str] = []
@@ -100,13 +105,32 @@ class ReviewEngine:
 
         # Previous findings for resolution tracking
         if previous_findings:
-            parts.append(
+            resolution_section = (
                 "\n\n---\n"
                 "PREVIOUS REVIEW FINDINGS (from the last push on this PR):\n"
-                "Compare these against the current diff above. If a finding "
-                "has been addressed — even if the fix is in a related area of "
-                "the code rather than the exact line originally flagged — mark "
-                "it as resolved with ✅ and strikethrough (~~text~~) in your "
+            )
+
+            # If we have an incremental diff, include it so the model
+            # knows what actually changed since the last review
+            if incremental_diff:
+                resolution_section += (
+                    "CHANGES SINCE LAST REVIEW (only new commits):\n"
+                    f"{incremental_diff}\n\n"
+                    "Use the above incremental changes to determine which "
+                    "previous findings were addressed. A finding is resolved "
+                    "if the incremental changes fix the concern — even if the "
+                    "fix is in a related area rather than the exact original line.\n\n"
+                )
+            else:
+                resolution_section += (
+                    "Compare these against the current diff above. If a finding "
+                    "has been addressed — even if the fix is in a related area of "
+                    "the code rather than the exact line originally flagged — mark "
+                    "it as resolved.\n\n"
+                )
+
+            resolution_section += (
+                "Mark resolved findings with ✅ and strikethrough (~~text~~) in your "
                 "new Findings section, e.g.:\n"
                 "  ✅ ~~🟠 Major *Correctness* — `src/App.tsx`: missing null "
                 "check~~ (resolved in this push)\n"
@@ -116,5 +140,6 @@ class ReviewEngine:
                 f"{previous_findings}\n"
                 "---\n"
             )
+            parts.append(resolution_section)
 
         return "\n\n".join(parts)

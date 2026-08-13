@@ -43,6 +43,15 @@ def main() -> None:
     raw_diff = github.get_pr_diff()
     diff = filter_diff(raw_diff, config.home_directory)
 
+    # Fetch incremental diff separately for resolution tracking — this
+    # tells the LLM what changed SINCE the last review so it can
+    # accurately determine which prior findings were addressed.
+    incremental_diff = ""
+    if last_reviewed_sha:
+        raw_incremental = github.get_pr_diff(base_sha=last_reviewed_sha)
+        if raw_incremental:
+            incremental_diff = filter_diff(raw_incremental, config.home_directory)
+
     # Fetch head SHA for labeling the comment
     head_sha = github.get_pr_head_sha()
 
@@ -115,6 +124,7 @@ def main() -> None:
         context=context,
         rules_prompt=rules_prompt,
         learnings_prompt=learnings_prompt,
+        incremental_diff=incremental_diff,
     )
     if raw_output is None:
         print("No review to post (all models failed).")
@@ -218,8 +228,9 @@ def _finding_already_posted(finding, existing_threads: list[dict]) -> bool:
     """Check if a finding matches an existing unresolved bot thread.
 
     Matches by file path and keyword overlap in the comment body.
-    This prevents the bot from posting the same inline comment on
-    every push when the developer hasn't addressed it yet.
+    Requires BOTH high keyword overlap AND at least 3 shared keywords
+    to avoid false positives where two different concerns on the same
+    file share domain vocabulary (e.g., "token", "auth", "validate").
     """
     import re as _re
 
@@ -232,10 +243,21 @@ def _finding_already_posted(finding, existing_threads: list[dict]) -> bool:
         existing_body = thread["body"].lower()
         finding_body = finding.format_body().lower()
 
-        # Extract meaningful words (4+ chars)
+        # Extract meaningful words (4+ chars, skip common review boilerplate)
+        stop_words = {
+            "this", "that", "with", "from", "have", "been", "will",
+            "would", "could", "should", "about", "their", "which",
+            "when", "where", "what", "than", "them", "then", "into",
+            "some", "other", "more", "very", "just", "also", "your",
+            "each", "only", "major", "minor", "critical", "finding",
+            "suggestion", "suggested", "change", "code", "file",
+            "line", "function", "method", "class", "return", "value",
+        }
+
         def extract_words(text):
             cleaned = _re.sub(r"[`*~#\[\](){}|>]", " ", text)
-            return set(_re.findall(r"\b[a-z]{4,}\b", cleaned))
+            words = set(_re.findall(r"\b[a-z]{4,}\b", cleaned))
+            return words - stop_words
 
         existing_words = extract_words(existing_body)
         finding_words = extract_words(finding_body)
@@ -244,10 +266,12 @@ def _finding_already_posted(finding, existing_threads: list[dict]) -> bool:
             continue
 
         overlap = existing_words & finding_words
-        # If 40%+ of the finding's keywords are in the existing thread,
-        # it's likely the same concern
+
+        # Require BOTH conditions to consider it a duplicate:
+        # 1. At least 3 shared meaningful keywords (absolute threshold)
+        # 2. At least 50% of the finding's keywords overlap (relative threshold)
         overlap_ratio = len(overlap) / max(len(finding_words), 1)
-        if overlap_ratio >= 0.4:
+        if len(overlap) >= 3 and overlap_ratio >= 0.5:
             return True
 
     return False
