@@ -187,9 +187,12 @@ def main() -> None:
         print("No structured findings — inline review skipped.")
 
     # Auto-resolve threads from previous reviews (user pushed a fix)
-    # Passes the diff so the LLM can semantically evaluate whether each
-    # concern was addressed — not just whether the exact line changed.
-    resolve_outdated_threads(github, config, diff, head_sha=head_sha)
+    # Uses three passes: 1) match resolved findings from the summary,
+    # 2) GitHub's isOutdated flag, 3) semantic LLM check for the rest.
+    resolve_outdated_threads(
+        github, config, diff, head_sha=head_sha,
+        review_summary=review_output.summary,
+    )
 
 
 if __name__ == "__main__":

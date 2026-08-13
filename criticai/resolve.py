@@ -3,10 +3,12 @@
 When a user pushes a fix, this module evaluates ALL unresolved review
 threads posted by CriticAI — not just ones GitHub marks as "outdated".
 
-Instead of relying on GitHub's naive line-position check (which only
-triggers when the exact line changes), we use Claude to analyze the
-surrounding code and the new diff to determine whether the concern
-raised in the review comment has been semantically addressed.
+Resolution detection uses three passes (cheapest first):
+1. Summary-driven: the review LLM already struck through resolved
+   findings in the summary comment — match those against open threads.
+2. GitHub isOutdated: threads where the line position no longer exists.
+3. Semantic LLM check: for remaining threads, ask Claude if the concern
+   was addressed by analyzing the surrounding code + diff.
 
 Uses the GitHub GraphQL API because resolving review threads is not
 available via the REST API.
@@ -14,6 +16,7 @@ available via the REST API.
 
 from __future__ import annotations
 
+import re
 from typing import TYPE_CHECKING, Optional
 
 import requests
@@ -109,14 +112,17 @@ def resolve_outdated_threads(
     config: "Config",
     diff: str = "",
     head_sha: Optional[str] = None,
+    review_summary: Optional[str] = None,
 ) -> int:
     """Find and resolve review threads whose concerns have been addressed.
 
-    Uses a two-pass approach:
-    1. Fast path: threads GitHub already marked as outdated are resolved
-       immediately (no LLM call needed — the line was clearly changed).
-    2. Semantic path: for remaining unresolved threads, asks Claude whether
-       the concern was addressed by analyzing the surrounding code + diff.
+    Uses a three-pass approach (cheapest first):
+    1. Summary-driven: if the review LLM struck through findings in the
+       summary (✅ ~~...~~), match those against open threads by file path
+       and resolve them directly. Zero extra LLM calls.
+    2. GitHub isOutdated: threads where the diff position no longer exists.
+    3. Semantic LLM: for remaining threads, ask Claude if the concern was
+       addressed by analyzing the surrounding code + diff.
 
     Args:
         github: The GitHub client instance.
@@ -124,6 +130,8 @@ def resolve_outdated_threads(
         diff: The PR diff text (needed for semantic analysis).
         head_sha: The PR head commit SHA for fetching file content at the
                   correct revision. Falls back to default branch if None.
+        review_summary: The review summary markdown (contains ✅ ~~resolved~~
+                       findings that can be matched against threads).
 
     Returns the number of threads resolved.
     """
@@ -138,6 +146,11 @@ def resolve_outdated_threads(
 
     # Resolve the bot's login to only touch our own threads
     bot_login = github._resolve_bot_login()
+
+    # Parse resolved findings from the summary comment (pass 1 matching data)
+    resolved_patterns = _extract_resolved_findings(review_summary)
+    if resolved_patterns:
+        print(f"Found {len(resolved_patterns)} resolved finding(s) in review summary.")
 
     # Fetch all review threads
     response = session.post(GRAPHQL_URL, json={
@@ -181,17 +194,26 @@ def resolve_outdated_threads(
             continue
 
         thread_id = thread["id"]
+        file_path = thread.get("path") or ""
+        comment_body = first_comment.get("body", "")
 
-        # Fast path: GitHub already marked it as outdated (line was changed)
+        # Pass 1: summary-driven resolution (the review LLM already said it's fixed)
+        if _matches_resolved_finding(comment_body, file_path, resolved_patterns):
+            if _resolve_thread(session, thread_id, "✅ Fixed — this concern was addressed in the latest push."):
+                resolved_count += 1
+                print(f"  Resolved (summary match): {file_path}")
+            continue
+
+        # Pass 2: GitHub already marked it as outdated (line was changed)
         if thread.get("isOutdated"):
             if _resolve_thread(session, thread_id, "✅ Fixed — this finding no longer applies to the current code."):
                 resolved_count += 1
             continue
 
-        # Collect for semantic analysis
+        # Collect for semantic analysis (pass 3)
         semantic_candidates.append(thread)
 
-    # Semantic path: use the LLM to check remaining threads (capped)
+    # Pass 3: Semantic LLM check for remaining threads (capped)
     if semantic_candidates and diff:
         capped = semantic_candidates[:_MAX_SEMANTIC_CHECKS]
         if len(semantic_candidates) > _MAX_SEMANTIC_CHECKS:
@@ -219,7 +241,7 @@ def resolve_outdated_threads(
                 resolution_msg = f"✅ Fixed — LLM determined this concern was addressed: {reason}"
                 if _resolve_thread(session, thread_id, resolution_msg):
                     resolved_count += 1
-                    print(f"  Resolved: {file_path}:{line_number} — {reason}")
+                    print(f"  Resolved (semantic): {file_path}:{line_number} — {reason}")
             else:
                 print(f"  Still open: {file_path}:{line_number} — {reason}")
 
@@ -230,6 +252,67 @@ def resolve_outdated_threads(
 
     return resolved_count
 
+
+# ------------------------------------------------------------------
+# Pass 1: Summary-driven resolution
+# ------------------------------------------------------------------
+
+def _extract_resolved_findings(summary: Optional[str]) -> list[dict]:
+    """Parse resolved findings from the review summary comment.
+
+    The review LLM marks resolved findings with:
+      ✅ ~~🟠 Major *Security* — `src/hooks/Chat/foo.ts`: description~~ (resolved in this push)
+
+    Returns a list of dicts with keys: file_path, description_snippet
+    """
+    if not summary:
+        return []
+
+    resolved = []
+
+    # Match patterns like: ✅ ~~...`path/to/file.ts`...~~
+    # Also handles: ✅ ~~...`path/to/file.ts`:...~~
+    # The review LLM puts file paths in backticks within the strikethrough.
+    pattern = re.compile(
+        r"✅\s*~~.*?`([^`]+\.[a-zA-Z]+)`.*?~~",
+    )
+
+    for match in pattern.finditer(summary):
+        file_path = match.group(1)
+        if file_path:
+            resolved.append({
+                "file_path": file_path,
+                "full_text": match.group(0),
+            })
+
+    return resolved
+
+
+def _matches_resolved_finding(
+    comment_body: str, thread_file_path: str, resolved_patterns: list[dict]
+) -> bool:
+    """Check if a thread matches one of the resolved findings from the summary.
+
+    Matches by file path. If the thread's file matches a resolved finding's
+    file, we consider it resolved (the review LLM already confirmed this).
+    """
+    if not resolved_patterns or not thread_file_path:
+        return False
+
+    for pattern in resolved_patterns:
+        pattern_file = pattern["file_path"]
+        # Match if the thread's file path ends with or equals the pattern file
+        if (thread_file_path == pattern_file or
+                thread_file_path.endswith("/" + pattern_file) or
+                pattern_file.endswith("/" + thread_file_path)):
+            return True
+
+    return False
+
+
+# ------------------------------------------------------------------
+# Pass 2/3: Thread resolution via GraphQL
+# ------------------------------------------------------------------
 
 def _resolve_thread(session: requests.Session, thread_id: str, message: str) -> bool:
     """Reply to a thread with a message and then resolve it.
@@ -273,6 +356,10 @@ def _resolve_thread(session: requests.Session, thread_id: str, message: str) -> 
         .get("isResolved", False)
     )
 
+
+# ------------------------------------------------------------------
+# Pass 3: Semantic LLM resolution check
+# ------------------------------------------------------------------
 
 def _get_file_context(
     github: "GitHubClient",
@@ -380,8 +467,6 @@ def _extract_relevant_diff(diff: str, target_file: str) -> str:
     cross-file awareness. Falls back to the first 8KB of the full diff
     only if the target file isn't found.
     """
-    import re
-
     sections = re.split(r"(?=^diff --git )", diff, flags=re.MULTILINE)
     target_section = ""
     other_files = []
