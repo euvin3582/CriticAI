@@ -24,7 +24,7 @@ inputs:
       called through the separate bedrock-mantle endpoint automatically —
       see NOTICE.md.
     required: false
-    default: 'openai.gpt-5.6-sol'
+    default: 'us.anthropic.claude-sonnet-4-20250514-v1:0'
   fallback-model:
     description: >
       Model ID to retry with if the primary `model` call fails for any
@@ -32,7 +32,7 @@ inputs:
       response). Leave empty to disable fallback. Can mix providers, e.g.
       an OpenAI primary with an Anthropic fallback.
     required: false
-    default: 'us.anthropic.claude-3-5-haiku-20241022-v1:0'
+    default: 'us.anthropic.claude-sonnet-4-20250514-v1:0'
   max-tokens:
     description: >
       Max output tokens. For Anthropic, 3072 is Bedrock's ceiling for this
